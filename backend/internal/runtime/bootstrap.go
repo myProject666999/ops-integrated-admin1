@@ -8,7 +8,10 @@ import (
 	"sync"
 	"time"
 
+	"ops-admin-backend/internal/config"
+	"ops-admin-backend/internal/controllers"
 	"ops-admin-backend/internal/project"
+	"ops-admin-backend/internal/services"
 
 	_ "modernc.org/sqlite"
 )
@@ -39,6 +42,9 @@ type server struct {
 	projectSessions    *projectSessionManager
 	browserCloseLogMu  sync.Mutex
 	browserCloseStates map[string]*browserCloseState
+
+	appService    *services.AppService
+	appController *controllers.AppController
 }
 
 type apiError struct {
@@ -69,9 +75,21 @@ const credentialCipherPrefix = "enc:v1:"
 const browserCloseLogGracePeriod = 3 * time.Second
 
 func Run() {
-	loadEnvFiles(".env", "../.env")
-	cfg := loadAppConfig()
-	runtimeCfg = cfg
+	config.LoadEnvFiles(".env.local", ".env", "../.env")
+	cfg := config.LoadAppConfig()
+	config.RuntimeCfg = cfg
+
+	runtimeCfg = appConfig{
+		ADAPIURL:        cfg.ADAPIURL,
+		PrintAPIURL:     cfg.PrintAPIURL,
+		VPNSshAddr:      cfg.VPNSshAddr,
+		FirewallSSHAddr: cfg.FirewallSSHAddr,
+		CredentialKey:   cfg.CredentialKey,
+		ProjectCacheTTL: cfg.ProjectCacheTTL,
+		SessionIdleTTL:  cfg.SessionIdleTTL,
+		StaticDir:       cfg.StaticDir,
+	}
+
 	project.SetConfig(project.Config{
 		ADAPIURL:        cfg.ADAPIURL,
 		PrintAPIURL:     cfg.PrintAPIURL,
@@ -95,17 +113,28 @@ func Run() {
 		log.Printf("set busy_timeout failed: %v", err)
 	}
 
-	if err = initDB(db, cfg); err != nil {
+	if err = initDB(db, runtimeCfg); err != nil {
 		log.Fatalf("init db failed: %v", err)
+	}
+
+	appService := services.NewAppService(db, cfg)
+	appController := controllers.NewAppController(appService, db)
+
+	if err = ensureDefaultAdmin(db); err != nil {
+		log.Printf("ensure default admin failed: %v", err)
+	} else {
+		log.Println("初始化管理员账号完成，账号：admin，密码：admin123")
 	}
 
 	srv := &server{
 		db:                 db,
 		tokenTTL:           24 * time.Hour,
-		cfg:                cfg,
+		cfg:                runtimeCfg,
 		jobs:               make(map[string]*asyncOperateJob),
 		projectSessions:    newProjectSessionManager(),
 		browserCloseStates: make(map[string]*browserCloseState),
+		appService:         appService,
+		appController:      appController,
 	}
 
 	addr := os.Getenv("ADDR")
@@ -118,4 +147,21 @@ func Run() {
 	if err = router.Run(addr); err != nil {
 		log.Fatalf("listen failed: %v", err)
 	}
+}
+
+func ensureDefaultAdmin(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(1) FROM admins`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+
+	svc, err := services.NewAppServiceFromDSN(filepath.Clean("./db/ops_admin.db"), config.RuntimeCfg)
+	if err != nil {
+		return err
+	}
+	defer svc.Close()
+	return svc.Register("admin", "admin123")
 }
